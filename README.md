@@ -5,7 +5,13 @@ imported bank transactions lack detailed information regarding Amazon purchases 
 transactions and form budgets. This script takes care of a lot of the manual labor of comparing Amazon Orders via the
 website and Monarch Money.
 
-### Current Version 0.1
+### Current Version 1.0.0
+
+### New in Version 1.0.0
+- Now just drag-and-drop your entire Amazon data dump folder onto the script, and it will do the rest. It will automatically find the csvs it needs to process.
+- Script defaults to processing the previous month, but you can adjust the start_date and end_date in the config.ini file.
+- Fixed bug where the cmd line defaults overroad the config.ini file.
+- Added setup.py for easier installation.
 
 ### How It Works
 The script works by comparing transaction price data from your Amazon orders with bank/credit card transactions imported into Monarch Money (MM),
@@ -34,20 +40,19 @@ To run, create a config.ini file. The ini should look like this below.
 ```
 [DEFAULT]
 api_key = your_anthropic_claude_api_key
-csv_name = your_csv_file.csv or digital_items.csv file
-digital_transaction_csv_name = your_dig_orders_monetary.csv
-category_ids = monarch_category_ids_you_want_to_filter_out
 email = your_email
 password = your_password
 sleep_seconds = 1.0
+start_date = 2023-01-01
+end_date = 2023-01-31
 ```
 
-1. Drop your data dump folder from the Amazon request directly at the root of this package.
-2. For retail orders, set the csv_name variable to the path ./Your Orders/Retail.OrderHistory.1/Retail.OrderHistory.1.csv
-3. For digital orders, set the csv_name variable to the path ./Your Orders/Digital-Ordering.1/Digital Items.csv and the digital_transaction_csv_name to ./Your Orders/Digital-Ordering.1/Digital Orders Monetary.csv and set the `--is_digital_order` flag to true
+1. Drop your data dump folder from the Amazon request directly at the root of this package, it should be called 'Your Orders' by default.
 4. Adjust your sleep_seconds to avoid rate limiting.
 5. If you want category ids, the script prints all category ids at the beginning before matching and updating. You may exit the script and use that output to filter your transactions further on a subsequent run.
 6. Remove any transactions you don't want to process from the csvs.
+
+7. Install the requirements ```pip install -r requirements.txt``` or use your favorite build tool for the setup.py method.
 
 ```commandline
 python3 ./main.py --config config.ini
