@@ -5,7 +5,16 @@ imported bank transactions lack detailed information regarding Amazon purchases 
 transactions and form budgets. This script takes care of a lot of the manual labor of comparing Amazon Orders via the
 website and Monarch Money.
 
-### Current Version 1.0.0
+### Current Version 1.1.0
+
+### New in Version 1.1.0
+- Added dry run mode (`--dry_run` flag) to preview what transactions would be updated without making actual changes
+- Enhanced logging with detailed progress indicators showing:
+  - Which specific Amazon order/item is currently being processed
+  - What MonarchMoney transactions are being compared against each item
+  - Transaction amounts available for matching
+- Fixed boolean value parsing in config files (dry_run = false now works correctly)
+- Improved matching logic with two-phase approach: first tries to match individual items, then aggregates unmatched items by order ID for better handling of cases where items are charged individually rather than as a single order total
 
 ### New in Version 1.0.0
 - Now just drag-and-drop your entire Amazon data dump folder onto the script, and it will do the rest. It will automatically find the csvs it needs to process.
@@ -45,6 +54,7 @@ password = your_password
 sleep_seconds = 1.0
 start_date = 2023-01-01
 end_date = 2023-01-31
+dry_run = false
 ```
 
 1. Drop your data dump folder from the Amazon request directly at the root of this package, it should be called 'Your Orders' by default.
@@ -55,7 +65,11 @@ end_date = 2023-01-31
 7. Install the requirements ```pip install -r requirements.txt``` or use your favorite build tool for the setup.py method.
 
 ```commandline
+# Normal run
 python3 ./main.py --config config.ini
+
+# Dry run to preview changes without updating transactions
+python3 ./main.py --config config.ini --dry_run
 ```
 
 

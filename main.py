@@ -23,7 +23,7 @@ DELIVERY_DATE_INDEX = 2
 ORDER_DATE_INDEX = 3
 IS_DIGITAL_ORDER_INDEX = 5
 
-__version__ = "1.0.0"
+__version__ = "1.1.0"
 
 def process_csv_files(orders_file: str, transactions_file: str) -> []:
     # Read the CSV files
@@ -159,20 +159,186 @@ def parse_data(csv_file, digital_item_csv, digital_transaction_csv, start_date: 
     return orders
 
 
+async def match_individual_items(mm: MonarchMoney, anthropic_client: any, individual_items: List, 
+                                category_ids: List[str], cat_names: List[str], cat_map: dict, 
+                                sleep_seconds: float, dry_run: bool = False) -> List:
+    matched_items = []
+    unmatched_items = []
+    
+    for item in individual_items:
+        order_id, description, delivery_date, order_date, subtotal, is_digital = item
+        print(f"Processing individual item - Order ID: {order_id}, Description: {description[:50]}{'...' if len(description) > 50 else ''}, Amount: ${subtotal}")
+        if delivery_date == 'Not Available':
+            unmatched_items.append(item)
+            continue
+            
+        try:
+            transaction_date_start = (datetime.strptime(order_date, '%Y-%m-%dT%H:%M:%SZ') - timedelta(
+                days=1)).strftime('%Y-%m-%d')
+        except ValueError:
+            transaction_date_start = (datetime.strptime(order_date, '%Y-%m-%dT%H:%M:%S.%fZ') - timedelta(
+                days=1)).strftime('%Y-%m-%d')
+
+        try:
+            transaction_date_end = (
+                    datetime.strptime(delivery_date, '%Y-%m-%dT%H:%M:%SZ') + timedelta(days=4)).strftime(
+                '%Y-%m-%d')
+        except ValueError:
+            try:
+                transaction_date_end = (
+                        datetime.strptime(delivery_date, '%Y-%m-%dT%H:%M:%S.%fZ') + timedelta(
+                    days=4)).strftime('%Y-%m-%d')
+            except ValueError:
+                transaction_date_end = transaction_date_start
+
+        total_cost = round(subtotal, 2)
+        offset = 0
+        matched = False
+
+        while True:
+            amazon_transactions = await mm.get_transactions(
+                limit=DEFAULT_RECORD_LIMIT,
+                offset=offset,
+                start_date=transaction_date_start,
+                end_date=transaction_date_end,
+                category_ids=category_ids,
+                search='Amazon',
+                has_notes=False
+            )
+            prime_transactions = await mm.get_transactions(
+                limit=DEFAULT_RECORD_LIMIT,
+                offset=offset,
+                start_date=transaction_date_start,
+                end_date=transaction_date_end,
+                category_ids=category_ids,
+                search='Prime Video',
+                has_notes=False
+            )
+            transactions = amazon_transactions['allTransactions']['results'] + prime_transactions['allTransactions']['results']
+            print(f"  Found {len(transactions)} transactions between {transaction_date_start} and {transaction_date_end} for comparison")
+            if transactions:
+                print(f"  Transaction amounts: {[round(abs(t['amount']), 2) for t in transactions]} (looking for ${total_cost})")
+
+            for transaction in transactions:
+                rounded_transaction = round(abs(transaction['amount']), 2)
+                if rounded_transaction == total_cost:
+                    matched = True
+                    predicted_category = await classify_item(anthropic_client, cat_names, description)
+                    pprint(f"PRE-AGGREGATION Match - Item Description: {description}")
+                    pprint(f"PRE-AGGREGATION Predicted category: {predicted_category}")
+                    if dry_run:
+                        print(f"[DRY RUN] Would update transaction {transaction['id']} with category '{predicted_category}' and notes '{description} ~Pre-aggregation match via auto-classifier script~'")
+                    else:
+                        await mm.update_transaction(
+                            transaction_id=transaction['id'],
+                            notes=description + ' ~Pre-aggregation match via auto-classifier script~',
+                            category_id=cat_map.get(predicted_category, None)
+                        )
+                    matched_items.append(item)
+                    time.sleep(sleep_seconds)
+                    break
+
+            if matched or len(transactions) < DEFAULT_RECORD_LIMIT:
+                break
+
+            offset += DEFAULT_RECORD_LIMIT
+            time.sleep(sleep_seconds)
+
+        if not matched:
+            unmatched_items.append(item)
+    
+    return unmatched_items
+
+
 async def match_and_update_transactions(mm: MonarchMoney, anthropic_client: any, csv_file: str,
                                         digital_items_csv_file: str,
                                         digital_transact_csv: str,
                                         category_ids: List[str], sleep_seconds: float, start_date: str,
-                                        end_date: str) -> None:
+                                        end_date: str, dry_run: bool = False) -> None:
     unmatched_rows: List[Tuple[str, str, float]] = []
     mm_categories = await mm.get_transaction_categories()
     cat_names, cat_map = process_categories(mm_categories)
     pprint("category list")
     pprint(cat_map)
 
-    orders = parse_data(csv_file, digital_items_csv_file, digital_transact_csv, start_date, end_date)
-    for order_id, items in orders.items():
+    # Get individual items before aggregation for pre-aggregation matching
+    def get_individual_items(csv_file, digital_item_csv, digital_transaction_csv, start_date: str, end_date: str):
+        retail_order_id_index = 1
+        retail_sub_total_index = 9
+        retail_description_index = 23
+        retail_delivery_date_index = 18
+        retail_order_date_index = 2
 
+        def str_to_float(string, is_digital_order):
+            if not is_digital_order:
+                string = string.replace(',', '')
+            return round(float(string), 2)
+
+        def clean_retail_data(csv_file):
+            with open(csv_file, 'r') as file:
+                retail_data = csv.reader(file)
+                next(retail_data)
+                cleaned_data = []
+                for retail_row in retail_data:
+                    cleaned_data.append(
+                        [retail_row[retail_order_id_index], retail_row[retail_description_index],
+                         retail_row[retail_delivery_date_index],
+                         retail_row[retail_order_date_index], retail_row[retail_sub_total_index], 0])
+                return cleaned_data
+
+        individual_items = []
+        try:
+            cleaned_retail_data = clean_retail_data(csv_file)
+        except FileNotFoundError as e:
+            print(f"Error processing CSV file: {e}")
+            cleaned_retail_data = []
+
+        try:
+            digital_data = process_csv_files(digital_item_csv, digital_transaction_csv)
+        except FileNotFoundError as e:
+            print(f"Error processing CSV files: {e}")
+            digital_data = []
+
+        data = cleaned_retail_data + digital_data
+        data.sort(key=lambda x: x[ORDER_DATE_INDEX])
+
+        for row in data:
+            if datetime.strptime(start_date, "%Y-%m-%d") <= datetime.strptime(row[ORDER_DATE_INDEX].split('T')[0], "%Y-%m-%d") <= datetime.strptime(end_date, "%Y-%m-%d"):
+                item_subtotal = str_to_float(row[SUB_TOTAL_INDEX], row[IS_DIGITAL_ORDER_INDEX])
+                individual_items.append([row[ORDER_ID_INDEX], row[DESCRIPTION_INDEX], row[DELIVERY_DATE_INDEX], 
+                                       row[ORDER_DATE_INDEX], item_subtotal, row[IS_DIGITAL_ORDER_INDEX]])
+        
+        return individual_items
+
+    # Phase 1: Match individual items before aggregation
+    print("Phase 1: Matching individual items before aggregation...")
+    individual_items = get_individual_items(csv_file, digital_items_csv_file, digital_transact_csv, start_date, end_date)
+    unmatched_individual_items = await match_individual_items(mm, anthropic_client, individual_items, 
+                                                            category_ids, cat_names, cat_map, sleep_seconds, dry_run)
+    
+    # Phase 2: Aggregate remaining unmatched items and try matching again
+    print("Phase 2: Aggregating unmatched items and matching again...")
+    aggregated_orders = defaultdict(dict)
+    
+    def str_to_float(string, is_digital_order):
+        if not is_digital_order:
+            string = string.replace(',', '')
+        return round(float(string), 2)
+    
+    for item in unmatched_individual_items:
+        order_id, description, delivery_date, order_date, subtotal, is_digital = item
+        order_id = f'{order_id}'
+        
+        if order_id in aggregated_orders:
+            aggregated_orders[order_id]['total_cost'] += subtotal
+            aggregated_orders[order_id]['description'] += ' ' + description
+        else:
+            aggregated_orders[order_id] = {'total_cost': subtotal, 'description': description,
+                                         'delivery_date': delivery_date, 'order_date': order_date}
+
+    orders = aggregated_orders
+    for order_id, items in orders.items():
+        print(f"Processing aggregated order - Order ID: {order_id}, Description: {items['description'][:50]}{'...' if len(items['description']) > 50 else ''}, Amount: ${items['total_cost']}")
         pprint(f' processing orderID: {order_id}')
         if items['delivery_date'] == 'Not Available':
             continue
@@ -227,6 +393,9 @@ async def match_and_update_transactions(mm: MonarchMoney, anthropic_client: any,
                 'results']
 
             # pprint(f'Checked for transactions from {transaction_date_start} to {transaction_date_end}')
+            print(f"  Found {len(transactions)} transactions between {transaction_date_start} and {transaction_date_end} for comparison")
+            if transactions:
+                print(f"  Transaction amounts: {[round(abs(t['amount']), 2) for t in transactions]} (looking for ${total_cost})")
             pprint(f'transactions found for comparison: {len(transactions)}')
             for transaction in transactions:
                 rounded_transaction = round(abs(transaction['amount']), 2)
@@ -235,13 +404,16 @@ async def match_and_update_transactions(mm: MonarchMoney, anthropic_client: any,
                 if rounded_transaction == total_cost:
                     matched = True
                     predicted_category = await classify_item(anthropic_client, cat_names, items['description'])
-                    pprint(f"Matched Item Description: {items['description']}")
-                    pprint(f"Matched Predicted category: {predicted_category}")
-                    await mm.update_transaction(
-                        transaction_id=transaction['id'],
-                        notes=items['description'] + ' ~Automatically applied via auto-classifier script~',
-                        category_id=cat_map.get(predicted_category, None)
-                    )
+                    pprint(f"POST-AGGREGATION Match - Item Description: {items['description']}")
+                    pprint(f"POST-AGGREGATION Predicted category: {predicted_category}")
+                    if dry_run:
+                        print(f"[DRY RUN] Would update transaction {transaction['id']} with category '{predicted_category}' and notes '{items['description']} ~Post-aggregation match via auto-classifier script~'")
+                    else:
+                        await mm.update_transaction(
+                            transaction_id=transaction['id'],
+                            notes=items['description'] + ' ~Post-aggregation match via auto-classifier script~',
+                            category_id=cat_map.get(predicted_category, None)
+                        )
                     time.sleep(sleep_seconds)
                     break
 
@@ -264,8 +436,16 @@ async def match_and_update_transactions(mm: MonarchMoney, anthropic_client: any,
 def load_config(config_file):
     config = configparser.ConfigParser()
     config.read(config_file)
-    # Convert config section to dict, stripping quotes if present
-    return {k: v.strip("'\"") for k, v in config['DEFAULT'].items()}
+    # Convert config section to dict, stripping quotes if present and handling boolean values
+    result = {}
+    for k, v in config['DEFAULT'].items():
+        value = v.strip("'\"")
+        # Convert boolean strings to actual boolean values
+        if value.lower() in ('true', 'false'):
+            result[k] = value.lower() == 'true'
+        else:
+            result[k] = value
+    return result
 
 
 def get_first_of_previous_month():
@@ -298,6 +478,8 @@ def parse_args():
                         help="The earliest date from which you'd like to process transactions. Defaults to the first of last month.")
     parser.add_argument('--end_date', default=get_last_of_previous_month(), required=False,
                         help="The last date from which you'd like to process transactions. Defaults to the end of last month.")
+    parser.add_argument('--dry_run', action='store_true', default=False,
+                        help='Run in dry run mode - show what would be updated without making actual changes')
 
     args = parser.parse_args()
 
@@ -335,6 +517,7 @@ async def main():
     sleep_seconds = float(args.get('sleep_seconds', 1.0))
     start_date = args['start_date']
     end_date = args['end_date']
+    dry_run = args.get('dry_run', False)
 
     print(f"Monarch Category IDs: {category_ids}")
     print(f"Anthropic API Key: {api_key}")
@@ -346,6 +529,7 @@ async def main():
     print(f"Sleep seconds: {sleep_seconds}")
     print(f"start date: {start_date}")
     print(f"end date: {end_date}")
+    print(f"Dry run mode: {dry_run}")
 
     mm = MonarchMoney()
     client = AsyncAnthropic(api_key=api_key)
@@ -353,7 +537,7 @@ async def main():
     await mm.login(email, password)
     await match_and_update_transactions(mm, client, csv_name, digital_items_csv_name, digital_transaction_csv_name,
                                         category_ids, sleep_seconds,
-                                        start_date, end_date)
+                                        start_date, end_date, dry_run)
 
 
 if __name__ == '__main__':
